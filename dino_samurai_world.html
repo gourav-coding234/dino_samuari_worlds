@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Dino Samurai Worlds</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #f7f7f7; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: manipulation; }
+  #fs { position: fixed; top: 12px; left: 12px; z-index: 2; font: 14px system-ui, sans-serif; padding: 6px 12px;
+        border-radius: 6px; cursor: pointer; background: rgba(128,128,128,.25); color: #777; border: 1px solid rgba(128,128,128,.5); }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<button id="fs" tabindex="-1">Fullscreen (F)</button>
+<script>
+(() => {
+  const canvas = document.getElementById('game'), ctx = canvas.getContext('2d'), fsBtn = document.getElementById('fs');
+  let W = 800, H = 300, GY = 210;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const DX = () => Math.max(40, Math.min(140, W * 0.08));
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const FONT = 'system-ui, "Hiragino Sans", "Yu Gothic", "Noto Sans JP", sans-serif';
+
+  function resize() {
+    const w = innerWidth, h = innerHeight, s = Math.min(h / 300, w / 600);
+    W = w / s; H = h / s; GY = Math.round(H * 0.68);
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr * s, 0, 0, dpr * s, 0, 0);
+    if (typeof buildBackdrop === 'function') buildBackdrop();
+  }
+
+  const START_SPEED = 330, MAX_SPEED = 900, ACCEL = 7, GRAVITY = 1900, JUMP_V = 620, FEVER_AT = 15, DW = 60, DH = 51;
+
+  // ---------- Scenes: the world changes every 300 points ----------
+  // colours: sky top, sky bottom, sun/glow, mountains, ground, obstacle ink, accent
+  const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  const SCENES = [
+    { n: 'Classic',        acc: '#535353', body: '#535353', c: ['#f7f7f7', '#f7f7f7', '#f7f7f7', '#f7f7f7', '#f7f7f7', '#535353', '#535353'] },
+    { n: 'Samurai Dawn',   acc: '#f2c14e', body: '#4fae6a', c: ['#ffd1a8', '#ff8a7a', '#ff3b3b', '#b46b8a', '#3b2a3a', '#2b1b1f', '#f2c14e'] },
+    { n: 'Volcano Shrine', acc: '#ff8a1a', body: '#d9532b', c: ['#2b0a0a', '#b8360f', '#ffb347', '#3a1010', '#1c0707', '#150606', '#ff8a1a'] },
+    { n: 'Neon Tokyo',     acc: '#35f0ff', body: '#2c3a8c', c: ['#14052e', '#ff2f9a', '#35f0ff', '#2a0f5a', '#0b0220', '#0b0220', '#35f0ff'] },
+    { n: 'Winter Shrine',  acc: '#6fb3e0', body: '#4f9fd6', c: ['#b7d7ee', '#e4f1fa', '#ffffff', '#8fa9c4', '#eef5fa', '#2f4b66', '#6fb3e0'] },
+    { n: 'Moonlit Ninja',  acc: '#9fe6c0', body: '#2a3358', c: ['#050b1a', '#1c2d4f', '#fff6d0', '#0f1d33', '#0a1020', '#a9d9c4', '#9fe6c0'] },
+    { n: 'Great Wave',     acc: '#e8f6ff', body: '#e0873a', c: ['#fdf0d5', '#8cc3e0', '#fff3c0', '#2b5f8a', '#14365c', '#0e2a47', '#e8f6ff'] }
+  ].map(s => ({ ...s, c: s.c.map(hex) }));
+  const sceneOf = sc => { const k = Math.floor(sc / 300); return k === 0 ? 0 : ((k - 1) % (SCENES.length - 1)) + 1; };
+  let cur;
+  const C = (i, a = 1) => `rgba(${cur[i].map(Math.round)},${a})`;
+  const mixc = (i, j, t) => `rgb(${cur[i].map((v, k) => Math.round(v + (cur[j][k] - v) * t))})`;
+  const lum = i => .299 * cur[i][0] + .587 * cur[i][1] + .114 * cur[i][2];
+
+  // ---------- A new feature every 100 points ----------
+  const UNLOCKS = [
+    { at: 100,  id: 'coins',    title: 'Coins & combos',   tip: 'Grab coins in a row for combo points' },
+    { at: 200,  id: 'birds',    title: 'Flying enemies',   tip: 'Duck with ↓ or jump over them' },
+    { at: 300,  id: 'double',   title: 'Double jump',      tip: 'Press jump again in mid-air' },
+    { at: 400,  id: 'powers',   title: 'Power-ups',        tip: 'Shield blocks a hit, the clock slows time' },
+    { at: 500,  id: 'meteors',  title: 'Falling fire',     tip: 'A "!" shows where it will land' },
+    { at: 600,  id: 'tight',    title: 'Close calls',      tip: 'Skim an obstacle for bonus. Tight pairs appear' },
+    { at: 700,  id: 'fever',    title: 'Samurai Rage',     tip: 'Collect 15 coins, then slash everything' },
+    { at: 800,  id: 'shower',   title: 'Fire rain',        tip: 'Falling fire comes twice as often' },
+    { at: 900,  id: 'flocks',   title: 'Flocks',           tip: 'Flying enemies now come in pairs' },
+    { at: 1000, id: 'shuriken', title: 'Shuriken',         tip: 'Fast spinning stars fly low and mid' },
+    { at: 1100, id: 'hyper',    title: 'Hyper speed',      tip: 'The world just got faster' }
+  ];
+
+  // ---------- Audio ----------
+  let audio;
+  function beep(f, d, t = 'square', v = 0.05) {
+    try { audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+      const o = audio.createOscillator(), g = audio.createGain(); o.type = t; o.frequency.value = f; g.gain.value = v;
+      g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + d); o.connect(g); g.connect(audio.destination);
+      o.start(); o.stop(audio.currentTime + d); } catch (e) {}
+  }
+  let hi = 0; try { hi = +localStorage.getItem('dino-samurai-hi') || 0; } catch (e) {}
+  const saveHi = () => { try { localStorage.setItem('dino-samurai-hi', hi); } catch (e) {} };
+
+  // ---------- Dino sprite (the classic T-Rex) ----------
+  const BODY = ["..........########..","..........##.#####..","..........########..","..........########..","..........#####.....",
+    "#.........#####.....","#........######.....","##......#######.#...","###....###########..","####..############..",
+    ".###############.#..","..##############....","...############.....","....##########......"];
+  const LEGS = [[".....###..##........", ".....##...#.........", ".....#....##........"],
+                [".....##...###.......", ".....#....##........", ".....##...#........."]];
+  const PX = 3;
+  const rows = (r, x, y) => r.forEach((row, i) => { for (let c = 0; c < row.length; c++) if (row[c] === '#') ctx.fillRect(x + c * PX, y + i * PX, PX, PX); });
+
+  // ---------- State ----------
+  let state = 'idle', speed, score, runTime, T = 0, dist, flash, overAt, coinCount, combo, comboT, shield, slow, inv, jumps, shake, newBest, fever, charge, nextU, banner;
+  let scene, from, blendT, wflash, ring;
+  let dino, obstacles, coins, pows, meteor, meteorT, parts, floaters, clouds, bumps, deco, weather, duckHeld = false;
+  const has = id => UNLOCKS.findIndex(u => u.id === id) < nextU;
+
+  function buildBackdrop() {
+    clouds = Array.from({ length: Math.max(4, W / 200 | 0) }, () => ({ x: rnd(0, W), y: rnd(20, Math.max(50, GY - 140)) }));
+    bumps = Array.from({ length: W / 24 | 0 }, () => ({ x: rnd(0, W), w: rnd(1, 4), dy: rnd(8, Math.max(12, (H - GY) * .85)) }));
+    deco = Array.from({ length: Math.ceil(W / 260) + 2 }, (_, i) => ({ x: i * 260 + rnd(0, 90), t: i % 2 }));
+    weather = Array.from({ length: Math.round(W / 40) }, () => ({ x: rnd(0, W), y: rnd(0, H), v: Math.random(), ph: rnd(0, 6), r: rnd(2.5, 4.5) }));
+  }
+  function reset() {
+    speed = START_SPEED; score = 0; runTime = 0; dist = 0; flash = 0; coinCount = 0; combo = 0; comboT = 0;
+    fever = 0; charge = 0; shield = false; slow = 0; inv = 0; jumps = 0; shake = 0; newBest = false; nextU = 0;
+    scene = 0; from = 0; blendT = 1; wflash = 0; ring = -1;
+    banner = { t: 0 }; dino = { y: 0, vy: 0, duck: false };
+    obstacles = []; coins = []; pows = []; meteor = null; meteorT = 3; parts = []; floaters = [];
+    cur = SCENES[0].c.map(a => a.slice());
+    buildBackdrop();
+  }
+  resize(); reset(); addEventListener('resize', resize);
+
+  const burst = (x, y, n, sp = 220, c = null) => { for (let i = 0; i < n; i++) { const a = rnd(0, 6.28), v = rnd(40, sp);
+    parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 60, life: rnd(.4, .9), max: .9, s: rnd(2, 5), c }); } };
+  const say = (x, y, text, c = null) => floaters.push({ x, y, text, c, t: 1 });
+  const fan = () => [520, 660, 880].forEach((f, i) => setTimeout(() => beep(f, .15, 'square', .05), i * 110));
+
+  function unlock(u) {
+    banner = { t: 2.6, title: u.title, tip: u.tip }; flash = 1; shake = .2; fan();
+    if (u.id === 'hyper') speed = Math.min(MAX_SPEED, speed * 1.12);
+  }
+  function changeScene(ns, u) {
+    from = scene; scene = ns; blendT = 0; wflash = .7; shake = .35; ring = 0; flash = 1;
+    burst(DX() + DW / 2, GY - dino.y - 25, 44, 400, SCENES[ns].acc);
+    banner = { t: 3, scene: SCENES[ns].n, title: u ? u.title : '', tip: u ? u.tip : 'The world transforms!' };
+    [440, 554, 659, 880].forEach((f, i) => setTimeout(() => beep(f, .18, 'triangle', .06), i * 100));
+    if (u && u.id === 'hyper') speed = Math.min(MAX_SPEED, speed * 1.12);
+  }
+
+  // ---------- Input ----------
+  function jump() {
+    if (state === 'idle') state = 'run';
+    if (state === 'over') { if (performance.now() - overAt > 400) { reset(); state = 'run'; } return; }
+    const px = DX() + DW / 2;
+    if (dino.y === 0) { dino.vy = JUMP_V; jumps = 1; beep(660, .12); burst(px, GY, 4, 90); }
+    else if (has('double') && jumps < 2) { dino.vy = JUMP_V * .85; jumps = 2; beep(920, .12, 'triangle'); burst(px, GY - dino.y, 8, 120, SCENES[scene].acc); }
+  }
+  function fullscreen() { try { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {}); } catch (e) {} }
+  fsBtn.onclick = () => { fullscreen(); fsBtn.blur(); };
+  document.addEventListener('fullscreenchange', () => { fsBtn.textContent = document.fullscreenElement ? 'Exit fullscreen (F)' : 'Fullscreen (F)'; });
+  addEventListener('keydown', e => {
+    if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); if (!e.repeat) jump(); }
+    if (e.code === 'ArrowDown') { e.preventDefault(); duckHeld = true; }
+    if (e.code === 'KeyF' && !e.repeat) fullscreen();
+  });
+  addEventListener('keyup', e => { if (e.code === 'ArrowDown') duckHeld = false; });
+  canvas.addEventListener('pointerdown', e => { e.preventDefault(); jump(); });
+
+  // ---------- Spawning (obstacles depend on the scene) ----------
+  const KINDS = [['cactus', 'cactus'], ['lantern', 'bamboo'], ['rock', 'flame'], ['chochin', 'sign'], ['snowlantern', 'snowman'], ['stakes', 'bamboo'], ['wave', 'wtorii']];
+  function spawn() {
+    let o; const r = Math.random(), sh = has('shuriken') ? .16 : 0, s = scene;
+    if (r < sh) o = { type: 'star', s, x: W + 60, w: 26, h: 26, lift: [22, 55][Math.random() * 2 | 0] };
+    else if (has('birds') && r < sh + Math.min(.3, .12 + score / 4000)) {
+      const lift = [18, 48, 80][Math.random() * 3 | 0];
+      o = { type: 'bird', s, x: W + 60, w: 42, h: 28, lift };
+      if (has('flocks') && Math.random() < .4) { obstacles.push(o); o = { type: 'bird', s, x: W + 135, w: 42, h: 28, lift }; }
+    } else {
+      const n = 1 + (Math.random() * 3 | 0), tall = Math.random() < .5, h = tall ? 62 : 44;
+      o = { type: 'ground', s, kind: KINDS[s][tall ? 1 : 0], seed: Math.random() * 4 | 0, x: W + 60, w: 28 + (n - 1) * 22, h, n, lift: 0 };
+      if (has('coins') && Math.random() < .6) for (let i = 0; i < 5; i++)
+        coins.push({ x: W + 10 + i * (o.w + 100) / 4, lift: 24 + (h + 30) * Math.sin(Math.PI * i / 4), ph: i });
+    }
+    o.gap = o.w + speed * rnd(.72, 1.5);
+    if (has('tight') && Math.random() < .12) o.gap = o.w + speed * .32;
+    if (has('powers') && o.type === 'ground' && Math.random() < .1) pows.push({ type: Math.random() < .5 ? 'shield' : 'slow', x: W + 60 + o.w + o.gap / 2, lift: 45 });
+    obstacles.push(o);
+  }
+  const syncY = () => obstacles.forEach(o => { o.y = GY - o.lift - o.h; });
+
+  // ---------- Hits ----------
+  function box() { const d = dino.duck && dino.y === 0, w = d ? DW * 1.3 : DW, h = d ? DH * .6 : DH;
+    return { x: DX() + 8, y: GY - dino.y - h + 6, w: w - 16, h: h - 10 }; }
+  const hit = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  function hurt(x, y) {
+    if (inv > 0 || fever > 0) return true;
+    if (shield) { shield = false; inv = 1; shake = .3; beep(300, .25, 'sawtooth'); burst(x, y, 24, 300, '#7fe0ff'); say(DX(), GY - 90, 'Shield broke!', '#7fe0ff'); return true; }
+    die(); return false;
+  }
+  function die() {
+    state = 'over'; overAt = performance.now(); shake = .6;
+    beep(150, .4, 'sawtooth', .07); burst(DX() + DW / 2, GY - dino.y - 25, 40, 360, SCENES[scene].body);
+    if (Math.floor(score) > hi) { hi = Math.floor(score); saveHi(); newBest = true; }
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+    T += dt;
+    parts = parts.filter(p => (p.life -= dt) > 0); parts.forEach(p => { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 700 * dt; });
+    floaters = floaters.filter(f => (f.t -= dt) > 0); floaters.forEach(f => { f.y -= 30 * dt; });
+    if (shake > 0) shake -= dt; if (banner.t > 0) banner.t -= dt; if (wflash > 0) wflash -= dt * 1.5;
+    if (blendT < 1) blendT = Math.min(1, blendT + dt / 1.2);
+    if (ring >= 0 && (ring += dt) > .6) ring = -1;
+    const tg = SCENES[scene].c, k = Math.min(1, dt * 2.2), run = state === 'run';
+    cur.forEach((a, i) => a.forEach((v, j) => { a[j] += (tg[i][j] - v) * k; }));
+    weather.forEach(p => {
+      if (scene === 1) { p.x -= (30 + (run ? speed * .2 : 0)) * dt; p.y += (25 + p.v * 30) * dt; p.x += Math.sin(p.ph + T * 2) * 20 * dt; if (p.x < -10 || p.y > H) { p.x = W + rnd(0, 60); p.y = rnd(-30, GY * .5); } }
+      else if (scene === 2) { p.x -= (20 + (run ? speed * .1 : 0)) * dt; p.y -= (30 + p.v * 60) * dt; p.x += Math.sin(p.ph + T * 3) * 15 * dt; if (p.y < -10 || p.x < -10) { p.x = rnd(0, W); p.y = H + rnd(0, 30); } }
+      else if (scene === 3) { p.x -= (run ? speed * .25 : 60) * dt; p.y += (500 + p.v * 300) * dt; if (p.y > H || p.x < -10) { p.x = rnd(0, W + 200); p.y = rnd(-100, 0); } }
+      else if (scene === 4) { p.x -= (20 + (run ? speed * .12 : 0)) * dt; p.y += (30 + p.v * 50) * dt; p.x += Math.sin(p.ph + T) * 25 * dt; if (p.y > H || p.x < -10) { p.x = rnd(0, W + 40); p.y = rnd(-30, 0); } }
+      else if (scene === 5) { p.x += Math.sin(p.ph + T * .8) * 25 * dt - (run ? speed * .08 : 10) * dt; p.y += Math.cos(p.ph * 2 + T * .7) * 18 * dt; if (p.x < -10) { p.x = W + 10; p.y = rnd(40, GY); } }
+      else if (scene === 6) { p.x -= (run ? speed * .35 : 80) * dt; p.y -= (10 + p.v * 40) * dt; if (p.x < -10 || p.y < 0) { p.x = W + rnd(0, 60); p.y = rnd(GY * .5, GY + 20); } }
+    });
+    clouds.forEach(c => { c.x -= (run ? speed * .2 : 12) * dt; if (c.x < -50) { c.x = W + 20; c.y = rnd(20, Math.max(50, GY - 140)); } });
+    if (!run) return;
+
+    if (slow > 0) slow -= dt; if (inv > 0) inv -= dt;
+    if (fever > 0) { parts.push({ x: DX() + 10, y: GY - dino.y - rnd(5, 45), vx: -240, vy: rnd(-20, 20), life: .45, max: .45, s: 6, c: `hsl(${T * 500 % 360},100%,60%)` });
+      if ((fever -= dt) <= 0) inv = 1.2; }
+    const sp = speed * (slow > 0 ? .6 : 1) * (fever > 0 ? 1.3 : 1);
+    runTime += dt; speed = Math.min(MAX_SPEED, speed + ACCEL * dt); dist += sp * dt;
+
+    const prev = score / 100 | 0; score += sp * dt * .03;
+    if ((score / 100 | 0) > prev) {
+      const ns = sceneOf(score); let u = null;
+      if (nextU < UNLOCKS.length && score >= UNLOCKS[nextU].at) u = UNLOCKS[nextU++];
+      if (ns !== scene) changeScene(ns, u); else if (u) unlock(u); else { flash = 1; beep(880, .15, 'square', .04); }
+    }
+    if (flash > 0) flash -= dt;
+    if (comboT > 0 && (comboT -= dt) <= 0) combo = 0;
+
+    dino.duck = duckHeld;
+    if (dino.y > 0 || dino.vy > 0) {
+      dino.y += dino.vy * dt; dino.vy -= GRAVITY * (duckHeld ? 2.5 : 1) * dt;
+      if (dino.y <= 0) { dino.y = 0; dino.vy = 0; jumps = 0; burst(DX() + DW / 2, GY, 5, 90); }
+    }
+
+    bumps.forEach(q => { q.x -= sp * dt; if (q.x < -10) q.x += W + 10; });
+    deco.forEach(d => { d.x -= sp * dt * .3; if (d.x < -120) { d.x = Math.max(...deco.map(e => e.x)) + rnd(240, 320); d.t = 1 - d.t; } });
+
+    const last = obstacles[obstacles.length - 1];
+    if (!last || W - (last.x + last.w) >= last.gap) spawn();
+    obstacles.forEach(o => o.x -= sp * dt * (o.type === 'bird' ? 1.15 : o.type === 'star' ? 1.45 : 1));
+    coins.forEach(c => c.x -= sp * dt); pows.forEach(p => p.x -= sp * dt);
+    obstacles = obstacles.filter(o => o.x + o.w > -10); coins = coins.filter(c => c.x > -30); pows = pows.filter(p => p.x > -30);
+    syncY();
+
+    const d = box();
+    if (has('tight')) for (const o of obstacles) if (!o.passed && o.x + o.w < d.x) { o.passed = true;
+      if (o.type === 'ground' && dino.y - o.h >= 0 && dino.y - o.h < 18) { score += 15; say(DX() + 30, GY - dino.y - 60, 'Close call +15', '#ffb703'); beep(1400, .06, 'triangle'); } }
+
+    for (const o of obstacles) if (hit(d, { x: o.x + 5, y: o.y + 5, w: o.w - 10, h: o.h - 10 })) {
+      if (!hurt(o.x + o.w / 2, o.y + o.h / 2)) break; o.dead = true; burst(o.x + o.w / 2, o.y + o.h / 2, 18, 260, SCENES[o.s].acc);
+      if (fever > 0) { score += 25; say(o.x, o.y - 10, '+25 SLASH'); shake = .12; beep(200, .1, 'sawtooth'); }
+    }
+    obstacles = obstacles.filter(o => !o.dead);
+    if (state !== 'run') return;
+
+    coins = coins.filter(c => {
+      if (!hit(d, { x: c.x - 10, y: GY - c.lift - 20, w: 20, h: 20 })) return true;
+      combo = Math.min(5, combo + 1); comboT = 1.5; coinCount++;
+      if (has('fever') && fever <= 0 && ++charge >= FEVER_AT) { charge = 0; fever = 6; banner = { t: 2, title: 'SAMURAI RAGE!', tip: 'Slash everything for 6 seconds' }; beep(1200, .4, 'sawtooth', .06); shake = .3; }
+      const pts = 5 * combo; score += pts;
+      beep(1000 + combo * 160, .08, 'triangle'); burst(c.x, GY - c.lift - 10, 6, 150, '#ffcf3a'); say(c.x, GY - c.lift - 24, '+' + pts, '#ffb703');
+      return false;
+    });
+    pows = pows.filter(p => {
+      if (!hit(d, { x: p.x - 12, y: GY - p.lift - 24, w: 24, h: 24 })) return true;
+      if (p.type === 'shield') { shield = true; say(p.x, GY - p.lift - 30, 'Shield!', '#7fe0ff'); } else { slow = 5; say(p.x, GY - p.lift - 30, 'Slow-mo!', '#d9a8ff'); }
+      beep(740, .25, 'triangle', .06); burst(p.x, GY - p.lift - 12, 14, 200); return false;
+    });
+
+    if (has('meteors') && !meteor && (meteorT -= dt) <= 0) { meteor = { x: rnd(W * .4, W * .92), y: -30, warn: 1.1 }; meteorT = has('shower') ? rnd(1.4, 3) : rnd(3, 6); }
+    if (meteor) {
+      if (meteor.warn > 0) meteor.warn -= dt;
+      else {
+        meteor.y += 760 * dt;
+        const cx = Math.max(d.x, Math.min(meteor.x, d.x + d.w)), cy = Math.max(d.y, Math.min(meteor.y, d.y + d.h));
+        if ((cx - meteor.x) ** 2 + (cy - meteor.y) ** 2 < 121) { if (!hurt(meteor.x, meteor.y)) return; burst(meteor.x, meteor.y, 20, 300, '#ffb703'); meteor = null; }
+        else if (meteor.y >= GY) { burst(meteor.x, GY, 20, 260, '#ffb703'); shake = .15; beep(110, .2, 'sawtooth', .05); meteor = null; }
+      }
+    }
+  }
+
+  // ---------- Drawing helpers ----------
+  const pad = n => String(Math.floor(n)).padStart(5, '0');
+  let TXD = true, TGD = true;                         // dark text on sky / on ground?
+  const tc = (a = 1) => TXD ? `rgba(43,27,31,${a})` : `rgba(255,247,234,${a})`;
+  const tg = (a = 1) => TGD ? `rgba(43,27,31,${a})` : `rgba(255,247,234,${a})`;
+  function text(s, x, y, size, color, align = 'center', weight = 'bold', font = FONT) {
+    ctx.font = `${weight} ${size}px ${font}`; ctx.textAlign = align; ctx.fillStyle = color; ctx.fillText(s, x, y);
+  }
+  function hills(base, amp, per, off, color) {
+    ctx.fillStyle = color; ctx.beginPath(); ctx.moveTo(0, GY + 2);
+    for (let x = 0; x <= W + 20; x += 20) ctx.lineTo(x, base - amp * (Math.sin((x + off) / per) + .5 * Math.sin((x + off) / (per * .43))));
+    ctx.lineTo(W + 20, GY + 2); ctx.fill();
+  }
+  const wrapX = (x, span) => ((x % span) + span) % span - span / 2 + 0;
+
+  // ---------- Backgrounds ----------
+  function fuji() {
+    const fx = ((W * .9 - dist * .03) % (W + 500) + W + 500) % (W + 500) - 250, top = GY - 140;
+    ctx.fillStyle = mixc(3, 1, .3); ctx.beginPath(); ctx.moveTo(fx - 250, GY); ctx.lineTo(fx - 40, top); ctx.lineTo(fx + 40, top); ctx.lineTo(fx + 250, GY); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.85)'; ctx.beginPath(); ctx.moveTo(fx - 40, top); ctx.lineTo(fx + 40, top); ctx.lineTo(fx + 104, top + 42);
+    [[60, 30], [30, 46], [0, 32], [-30, 46], [-60, 30]].forEach(([a, b]) => ctx.lineTo(fx + a, top + b)); ctx.lineTo(fx - 104, top + 42); ctx.fill();
+  }
+  function volcano() {
+    const span = W + 700, vx = ((W * .6 - dist * .02) % span + span) % span - 350, top = GY - 190;
+    const gl = ctx.createRadialGradient(vx, top, 10, vx, top, 280); gl.addColorStop(0, C(2, .55)); gl.addColorStop(1, C(2, 0)); ctx.fillStyle = gl; ctx.fillRect(vx - 280, top - 280, 560, 560);
+    ctx.fillStyle = C(3); ctx.beginPath(); ctx.moveTo(vx - 330, GY); ctx.lineTo(vx - 55, top); ctx.lineTo(vx + 55, top); ctx.lineTo(vx + 330, GY); ctx.fill();
+    ctx.fillStyle = C(2); ctx.beginPath(); ctx.ellipse(vx, top, 55, 10, 0, 0, 6.28); ctx.fill();
+    ctx.strokeStyle = C(2, .85); ctx.lineWidth = 4; ctx.lineCap = 'round';
+    [[-20, -80, 90], [15, 60, 110], [0, -8, 60]].forEach(([a, b, h], i) => { ctx.beginPath(); ctx.moveTo(vx + a, top + 6); ctx.lineTo(vx + b + Math.sin(T * 2 + i) * 3, top + h); ctx.stroke(); });
+    ctx.lineCap = 'butt';
+    for (let i = 0; i < 6; i++) { ctx.fillStyle = `rgba(50,25,25,${.5 - i * .06})`; ctx.beginPath(); ctx.arc(vx + Math.sin(T + i) * 12 + i * 9, top - 14 - i * 22, 16 + i * 5, 0, 6.28); ctx.fill(); }
+  }
+  function neonSun() {
+    const sx = W * .5, sy = Math.max(80, GY * .5), r = 62, g = ctx.createLinearGradient(0, sy - r, 0, sy + r); g.addColorStop(0, '#ffe36a'); g.addColorStop(1, '#ff2f9a');
+    ctx.save(); ctx.shadowColor = '#ff2f9a'; ctx.shadowBlur = 30; ctx.fillStyle = g; ctx.beginPath(); ctx.arc(sx, sy, r, 0, 6.28); ctx.fill(); ctx.shadowBlur = 0; ctx.clip();
+    ctx.fillStyle = 'rgba(20,5,46,.95)'; for (let k = 0; k < 5; k++) ctx.fillRect(sx - r, sy + 8 + k * k * 2.6 + k * 8, 2 * r, 2 + k * 1.2);
+    ctx.restore();
+  }
+  const BLD = Array.from({ length: 12 }, (_, i) => ({ x: i * 52, w: 34 + (i * 17) % 16, h: 50 + (i * 53) % 90 }));
+  function skyline() {
+    for (let off = -((dist * .1) % 624); off < W; off += 624) BLD.forEach((b, i) => {
+      const x = off + b.x; if (x > W || x + b.w < 0) return;
+      ctx.fillStyle = C(3); ctx.fillRect(x, GY - b.h, b.w, b.h);
+      for (let r = 0; r < b.h / 14 - 1; r++) for (let c = 0; c < b.w / 10 - .5; c++) if ((i * 7 + r * 3 + c * 5) % 4 === 0) { ctx.fillStyle = (r + c) % 2 ? 'rgba(255,47,154,.85)' : C(6, .8); ctx.fillRect(x + 4 + c * 10, GY - b.h + 6 + r * 14, 4, 5); }
+    });
+  }
+  function torii(x, b) { ctx.fillRect(x - 34, b - 92, 8, 92); ctx.fillRect(x + 26, b - 92, 8, 92); ctx.fillRect(x - 48, b - 104, 96, 9); ctx.fillRect(x - 38, b - 80, 76, 6); }
+  function pagoda(x, b) {
+    for (let t = 0; t < 3; t++) { const w = 64 - t * 18, y = b - t * 34;
+      ctx.fillRect(x - w / 2 + 6, y - 26, w - 12, 24);
+      ctx.beginPath(); ctx.moveTo(x - w / 2 - 10, y - 26); ctx.lineTo(x + w / 2 + 10, y - 26); ctx.lineTo(x + w / 2, y - 36); ctx.lineTo(x - w / 2, y - 36); ctx.fill(); }
+    ctx.fillRect(x - 2, b - 128, 4, 16);
+  }
+  function bgNew(s) {
+    const ga = ctx.globalAlpha;
+    if (s === 4) {                                                  // Winter Shrine
+      const sx = W * .7, sy = Math.max(70, GY * .4), gl = ctx.createRadialGradient(sx, sy, 10, sx, sy, 150);
+      gl.addColorStop(0, 'rgba(255,255,255,.8)'); gl.addColorStop(1, 'rgba(255,255,255,0)'); ctx.fillStyle = gl; ctx.fillRect(sx - 150, sy - 150, 300, 300);
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(sx, sy, 30, 0, 6.28); ctx.fill();
+      fuji(); hills(GY - 30, 30, 150, dist * .06, mixc(3, 1, .5));
+      ctx.fillStyle = mixc(3, 5, .25); deco.forEach(d => d.t ? pagoda(d.x, GY) : torii(d.x, GY));
+      hills(GY - 4, 12, 70, dist * .3, mixc(3, 4, .8));
+    } else if (s === 5) {                                           // Moonlit Ninja
+      const mx = W * .3, my = Math.max(70, GY * .38), gl = ctx.createRadialGradient(mx, my, 20, mx, my, 190);
+      gl.addColorStop(0, C(2, .45)); gl.addColorStop(1, C(2, 0)); ctx.fillStyle = gl; ctx.fillRect(mx - 190, my - 190, 380, 380);
+      ctx.fillStyle = '#fff'; for (let i = 0; i < 40; i++) { ctx.globalAlpha = ga * (.3 + .5 * Math.abs(Math.sin(T * 2 + i))); ctx.fillRect((i * 173.3) % W, (i * 61.7) % (GY * .65), 2, 2); } ctx.globalAlpha = ga;
+      ctx.fillStyle = C(2); ctx.beginPath(); ctx.arc(mx, my, 50, 0, 6.28); ctx.fill();
+      ctx.fillStyle = 'rgba(190,175,130,.45)'; [[-14, -10, 9], [12, 8, 12], [-6, 18, 6]].forEach(([a, b, r]) => { ctx.beginPath(); ctx.arc(mx + a, my + b, r, 0, 6.28); ctx.fill(); });
+      hills(GY - 26, 26, 140, dist * .06, mixc(3, 1, .5));
+      [[.1, 70, 6, .5], [.25, 110, 9, .9]].forEach(([par, gap, w, al], li) => {
+        ctx.fillStyle = mixc(3, 6, .1 + al * .12);
+        for (let x = -((dist * par) % gap) - gap; x < W + gap; x += gap) { const bx = x + li * 31;
+          ctx.fillRect(bx, 0, w, GY); for (let y = 30; y < GY; y += 48) ctx.fillRect(bx - 1, y, w + 2, 3);
+          ctx.beginPath(); ctx.moveTo(bx + w, 70 + li * 24); ctx.lineTo(bx + w + 28, 60 + li * 24); ctx.lineTo(bx + w + 4, 82 + li * 24); ctx.fill(); }
+      });
+    } else {                                                        // Great Wave
+      const sx = W * .8, sy = Math.max(60, GY * .3), gl = ctx.createRadialGradient(sx, sy, 10, sx, sy, 130), wx = ((W * .45 - dist * .04) % (W + 600) + W + 600) % (W + 600) - 300;
+      gl.addColorStop(0, C(2, .6)); gl.addColorStop(1, C(2, 0)); ctx.fillStyle = gl; ctx.fillRect(sx - 130, sy - 130, 260, 260);
+      ctx.fillStyle = '#e5423a'; ctx.beginPath(); ctx.arc(sx, sy, 32, 0, 6.28); ctx.fill();
+      hills(GY - 22, 12, 60, dist * .15, mixc(3, 1, .4));
+      ctx.fillStyle = C(3); ctx.beginPath(); ctx.moveTo(wx - 200, GY); ctx.quadraticCurveTo(wx - 170, GY - 120, wx - 40, GY - 150); ctx.quadraticCurveTo(wx + 60, GY - 175, wx + 120, GY - 110);
+      ctx.quadraticCurveTo(wx + 80, GY - 125, wx + 40, GY - 100); ctx.quadraticCurveTo(wx + 90, GY - 60, wx + 140, GY); ctx.fill();
+      ctx.fillStyle = C(6); [[-30, -148, 6], [0, -160, 7], [35, -166, 6], [70, -160, 7], [102, -140, 6], [118, -112, 5]].forEach(([a, b, r]) => { ctx.beginPath(); ctx.arc(wx + a, GY + b, r, 0, 6.28); ctx.fill(); });
+      hills(GY - 6, 8, 45, dist * .4, mixc(3, 4, .7));
+    }
+  }
+  function bgScene(s, a) {
+    if (s > 3) { ctx.save(); ctx.globalAlpha = a; bgNew(s); ctx.restore(); return; }
+    ctx.save(); ctx.globalAlpha = a;
+    if (s === 0) { ctx.fillStyle = C(5, .45); clouds.forEach(c => { ctx.fillRect(c.x, c.y, 46, 8); ctx.fillRect(c.x + 8, c.y - 6, 26, 6); }); }
+    else if (s === 1) {
+      const sx = W * .72, sy = Math.max(70, GY * .4), gl = ctx.createRadialGradient(sx, sy, 20, sx, sy, 170);
+      gl.addColorStop(0, C(2, .5)); gl.addColorStop(1, C(2, 0)); ctx.fillStyle = gl; ctx.fillRect(sx - 170, sy - 170, 340, 340);
+      ctx.fillStyle = C(2); ctx.beginPath(); ctx.arc(sx, sy, 42, 0, 6.28); ctx.fill();
+      fuji(); hills(GY - 30, 30, 150, dist * .06, mixc(3, 1, .55));
+      ctx.fillStyle = mixc(3, 4, .6); deco.forEach(d => d.t ? pagoda(d.x, GY) : torii(d.x, GY)); hills(GY - 4, 14, 70, dist * .3, mixc(3, 4, .8));
+    } else if (s === 2) {
+      volcano(); hills(GY - 22, 22, 130, dist * .08, mixc(3, 4, .4));
+      ctx.fillStyle = '#5a1010'; deco.forEach(d => d.t ? pagoda(d.x, GY) : torii(d.x, GY)); hills(GY - 4, 12, 70, dist * .3, mixc(3, 4, .85));
+    } else {
+      neonSun(); skyline();
+      ctx.save(); ctx.shadowColor = C(6); ctx.shadowBlur = 14; ctx.fillStyle = mixc(3, 4, .3); deco.forEach(d => d.t ? pagoda(d.x, GY) : torii(d.x, GY)); ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  // ---------- Obstacles ----------
+  function groundObs(o) {
+    for (let i = 0; i < o.n; i++) {
+      const cx = o.x + 14 + i * 22, yb = o.y + o.h, t = o.y; ctx.fillStyle = C(5);
+      switch (o.kind) {
+        case 'cactus': { const ay = t + o.h * .35; ctx.fillRect(cx - 4, t - 2, 8, o.h + 2); ctx.fillRect(cx - 13, ay, 9, 5); ctx.fillRect(cx - 13, ay - 13, 5, 18); ctx.fillRect(cx + 4, ay + 8, 9, 5); ctx.fillRect(cx + 8, ay - 5, 5, 18); break; }
+        case 'lantern':
+          ctx.fillRect(cx - 10, yb - 6, 20, 6); ctx.fillRect(cx - 3, yb - 24, 6, 18); ctx.fillRect(cx - 9, yb - 38, 18, 14);
+          ctx.beginPath(); ctx.moveTo(cx - 15, yb - 38); ctx.lineTo(cx + 15, yb - 38); ctx.lineTo(cx + 5, yb - 44); ctx.lineTo(cx - 5, yb - 44); ctx.fill();
+          ctx.fillStyle = '#ffcf70'; ctx.fillRect(cx - 4, yb - 35, 8, 8); break;
+        case 'bamboo':
+          ctx.fillRect(cx - 9, t + 6, 7, o.h - 6); ctx.fillRect(cx + 1, t, 8, o.h);
+          ctx.fillStyle = C(1); for (let k = 1; k < 4; k++) { ctx.fillRect(cx - 9, t + 6 + k * 14, 7, 2); ctx.fillRect(cx + 1, t + k * 15, 8, 2); }
+          ctx.fillStyle = C(5); ctx.beginPath(); ctx.moveTo(cx + 5, t + 14); ctx.lineTo(cx + 19, t + 8); ctx.lineTo(cx + 8, t + 20); ctx.fill(); break;
+        case 'rock':
+          ctx.beginPath(); ctx.moveTo(cx - 13, yb); ctx.lineTo(cx - 9, yb - 28); ctx.lineTo(cx - 3, yb - 20); ctx.lineTo(cx + 1, yb - 44); ctx.lineTo(cx + 7, yb - 22); ctx.lineTo(cx + 13, yb - 30); ctx.lineTo(cx + 14, yb); ctx.closePath(); ctx.fill();
+          ctx.strokeStyle = C(6); ctx.lineWidth = 2; ctx.stroke(); ctx.beginPath(); ctx.moveTo(cx - 2, yb - 8); ctx.lineTo(cx + 1, yb - 24); ctx.stroke(); break;
+        case 'flame': { const fl = Math.sin(T * 12 + i * 2) * 4;
+          ctx.fillRect(cx - 11, yb - 12, 22, 12); ctx.fillRect(cx - 14, yb - 16, 28, 5);
+          ctx.fillStyle = '#ff8a1a'; ctx.beginPath(); ctx.moveTo(cx - 10, yb - 16); ctx.quadraticCurveTo(cx - 14, yb - 36, cx + fl, yb - 62); ctx.quadraticCurveTo(cx + 14, yb - 36, cx + 10, yb - 16); ctx.fill();
+          ctx.fillStyle = '#ffe066'; ctx.beginPath(); ctx.moveTo(cx - 5, yb - 16); ctx.quadraticCurveTo(cx - 7, yb - 30, cx + fl * .6, yb - 46); ctx.quadraticCurveTo(cx + 7, yb - 30, cx + 5, yb - 16); ctx.fill(); break; }
+        case 'chochin':
+          ctx.strokeStyle = C(6); ctx.lineWidth = 2; ctx.fillRect(cx - 2, yb - 12, 4, 12); ctx.fillRect(cx - 7, yb - 44, 14, 4);
+          ctx.fillStyle = '#ff2f6a'; ctx.beginPath(); ctx.ellipse(cx, yb - 27, 12, 14, 0, 0, 6.28); ctx.fill(); ctx.stroke();
+          ctx.beginPath(); [-33, -27, -21].forEach(dy => { ctx.moveTo(cx - 11, yb + dy); ctx.lineTo(cx + 11, yb + dy); }); ctx.stroke(); break;
+        case 'snowlantern':
+          ctx.fillRect(cx - 10, yb - 6, 20, 6); ctx.fillRect(cx - 3, yb - 24, 6, 18); ctx.fillRect(cx - 9, yb - 38, 18, 14);
+          ctx.beginPath(); ctx.moveTo(cx - 15, yb - 38); ctx.lineTo(cx + 15, yb - 38); ctx.lineTo(cx + 5, yb - 44); ctx.lineTo(cx - 5, yb - 44); ctx.fill();
+          ctx.fillStyle = '#fff'; ctx.fillRect(cx - 12, yb - 42, 24, 4); ctx.fillRect(cx - 6, yb - 46, 12, 4); ctx.fillStyle = '#ffcf70'; ctx.fillRect(cx - 4, yb - 35, 8, 8); break;
+        case 'snowman':
+          ctx.fillStyle = '#fff'; ctx.strokeStyle = C(5); ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.arc(cx, yb - 15, 15, 0, 6.28); ctx.fill(); ctx.stroke(); ctx.beginPath(); ctx.arc(cx, yb - 40, 11, 0, 6.28); ctx.fill(); ctx.stroke();
+          ctx.fillStyle = C(5); ctx.fillRect(cx - 9, yb - 54, 18, 3); ctx.fillRect(cx - 6, yb - 62, 12, 9); ctx.fillRect(cx - 4, yb - 42, 2, 2); ctx.fillRect(cx + 3, yb - 42, 2, 2);
+          ctx.fillStyle = '#ff6a1a'; ctx.fillRect(cx, yb - 39, 6, 2); ctx.fillStyle = '#d62839'; ctx.fillRect(cx - 10, yb - 31, 20, 3); break;
+        case 'stakes':
+          [[-12, 34], [-2, 44], [8, 30]].forEach(([dx, h]) => { ctx.beginPath(); ctx.moveTo(cx + dx - 5, yb); ctx.lineTo(cx + dx, yb - h); ctx.lineTo(cx + dx + 5, yb); ctx.fill(); });
+          ctx.fillStyle = C(6); ctx.fillRect(cx - 14, yb - 12, 26, 3); break;
+        case 'wave':
+          ctx.beginPath(); ctx.moveTo(cx - 14, yb); ctx.quadraticCurveTo(cx - 14, yb - 30, cx + 2, yb - 40); ctx.quadraticCurveTo(cx + 16, yb - 46, cx + 14, yb - 30); ctx.quadraticCurveTo(cx + 6, yb - 34, cx + 4, yb - 26); ctx.quadraticCurveTo(cx + 10, yb - 12, cx + 14, yb); ctx.closePath(); ctx.fill();
+          ctx.fillStyle = C(6); [[-2, -42], [6, -44], [13, -34]].forEach(([dx, dy]) => { ctx.beginPath(); ctx.arc(cx + dx, yb + dy, 3, 0, 6.28); ctx.fill(); }); break;
+        case 'wtorii':
+          ctx.fillStyle = '#d62839'; ctx.fillRect(cx - 11, t + 8, 5, o.h - 8); ctx.fillRect(cx + 6, t + 8, 5, o.h - 8); ctx.fillRect(cx - 16, t, 32, 6); ctx.fillRect(cx - 12, t + 16, 24, 4); break;
+        case 'sign': { const nc = i % 2 ? '#ff2f9a' : C(6); ctx.strokeStyle = nc; ctx.lineWidth = 2;
+          ctx.fillRect(cx - 2, yb - 14, 4, 14); ctx.fillRect(cx - 11, yb - 62, 22, 48); ctx.strokeRect(cx - 11, yb - 62, 22, 48);
+          text('夜酒麺侍'[(o.seed + i) % 4], cx, yb - 31, 17, nc); break; }
+      }
+    }
+  }
+  function flyer(o) {
+    const x = o.x, y = o.y, up = (T * 7 | 0) % 2 === 0, s = o.s;
+    if (s === 5) {                                                  // bat
+      ctx.fillStyle = C(5); ctx.beginPath(); ctx.ellipse(x + 21, y + 16, 6, 8, 0, 0, 6.28); ctx.fill();
+      const f = up ? -10 : 8; ctx.beginPath(); ctx.moveTo(x + 16, y + 14); ctx.lineTo(x, y + 14 + f); ctx.lineTo(x + 6, y + 20); ctx.lineTo(x + 12, y + 17); ctx.lineTo(x + 16, y + 22); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x + 26, y + 14); ctx.lineTo(x + 42, y + 14 + f); ctx.lineTo(x + 36, y + 20); ctx.lineTo(x + 30, y + 17); ctx.lineTo(x + 26, y + 22); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x + 17, y + 9); ctx.lineTo(x + 19, y + 3); ctx.lineTo(x + 22, y + 9); ctx.moveTo(x + 21, y + 9); ctx.lineTo(x + 24, y + 3); ctx.lineTo(x + 26, y + 9); ctx.fill();
+      ctx.fillStyle = '#ff3b3b'; ctx.fillRect(x + 18, y + 12, 2, 2); ctx.fillRect(x + 23, y + 12, 2, 2); return;
+    }
+    if (s === 4 || s === 6) {                                       // crane / gull
+      ctx.fillStyle = '#fff'; ctx.strokeStyle = C(5); ctx.lineWidth = 1.5;
+      [[8, 14, 26, 8], [30, 10, 10, 8]].forEach(([a, b, w, h]) => { ctx.fillRect(x + a, y + b, w, h); ctx.strokeRect(x + a, y + b, w, h); });
+      ctx.fillStyle = C(5); ctx.beginPath();
+      if (up) { ctx.moveTo(x + 14, y + 14); ctx.lineTo(x + 28, y + 14); ctx.lineTo(x + 20, y); } else { ctx.moveTo(x + 14, y + 22); ctx.lineTo(x + 28, y + 22); ctx.lineTo(x + 20, y + 30); } ctx.fill();
+      ctx.fillStyle = s === 4 ? '#d62839' : '#f2b01e'; ctx.fillRect(x + 40, y + 13, s === 4 ? 9 : 5, 2.5); ctx.fillRect(x + 34, y + 9, 4, 2);
+      ctx.fillStyle = C(5); ctx.fillRect(x, y + 13, 8, 3); return;
+    }
+    if (s === 3) {                                                  // neon drone
+      ctx.fillStyle = C(5); ctx.strokeStyle = C(6); ctx.lineWidth = 2; ctx.fillRect(x + 10, y + 11, 24, 8); ctx.strokeRect(x + 10, y + 11, 24, 8);
+      ctx.fillRect(x + 4, y + 8, 3, 6); ctx.fillRect(x + 37, y + 8, 3, 6);
+      const rw = 8 + Math.abs(Math.cos(T * 40)) * 8; ctx.fillStyle = C(6); ctx.fillRect(x + 5 - rw / 2, y + 6, rw, 2); ctx.fillRect(x + 38 - rw / 2, y + 6, rw, 2);
+      ctx.fillStyle = '#ff2f6a'; ctx.beginPath(); ctx.arc(x + 22, y + 15, 2.5, 0, 6.28); ctx.fill(); return;
+    }
+    ctx.fillStyle = s === 2 ? '#ff6a1a' : C(5);
+    ctx.fillRect(x + 8, y + 14, 26, 8); ctx.fillRect(x + 30, y + 10, 10, 8); ctx.fillRect(x, y + 12, 8, 4);
+    ctx.fillStyle = s === 2 ? '#ffd166' : C(5); ctx.beginPath();
+    if (up) { ctx.moveTo(x + 14, y + 14); ctx.lineTo(x + 28, y + 14); ctx.lineTo(x + 20, y); } else { ctx.moveTo(x + 14, y + 22); ctx.lineTo(x + 28, y + 22); ctx.lineTo(x + 20, y + 30); } ctx.fill();
+    ctx.fillStyle = s === 1 ? '#f2c14e' : C(5); ctx.fillRect(x + 38, y + 13, 6, 3);
+    if (s === 1) { ctx.fillStyle = '#ff3b3b'; ctx.fillRect(x + 35, y + 12, 2, 2); }
+    if (s === 2) { ctx.fillStyle = '#ffd166'; ctx.beginPath(); ctx.moveTo(x + 2, y + 14); ctx.lineTo(x - 12, y + 10 + Math.sin(T * 20) * 3); ctx.lineTo(x + 2, y + 20); ctx.fill(); }
+  }
+  function shuriken(o) {
+    const cx = o.x + 13, cy = o.y + 13, a0 = T * 14; ctx.fillStyle = o.s === 2 ? '#ff8a1a' : o.s === 3 ? C(6) : C(5); ctx.beginPath();
+    for (let i = 0; i < 8; i++) { const r = i % 2 ? 5 : 14, a = a0 + i * Math.PI / 4; ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r); }
+    ctx.fill(); ctx.fillStyle = C(1); ctx.beginPath(); ctx.arc(cx, cy, 2.5, 0, 6.28); ctx.fill();
+  }
+
+  // ---------- The dino and its costumes ----------
+  function costume(x, y) {
+    const ph = T * 14, ac = SCENES[scene].acc;
+    if (scene === 1) {                                              // samurai: kasa hat, scarf, armor, katana
+      ctx.fillStyle = '#d9b56b'; ctx.beginPath(); ctx.moveTo(x + 24, y + 2); ctx.lineTo(x + 42, y - 16); ctx.lineTo(x + 62, y + 2); ctx.fill();
+      ctx.fillStyle = '#a8823a'; ctx.fillRect(x + 24, y + 1, 38, 2.5);
+      ctx.fillStyle = '#d62839'; ctx.fillRect(x + 27, y + 15, 20, 5); for (let i = 0; i < 4; i++) ctx.fillRect(x + 21 - i * 6, y + 15 + Math.sin(ph + i) * 3, 6, 4);
+      ctx.fillRect(x + 14, y + 27, 32, 9); ctx.fillStyle = '#f2c14e'; ctx.fillRect(x + 14, y + 31, 32, 1.5);
+      ctx.strokeStyle = '#1b1b1f'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(x + 38, y + 26); ctx.lineTo(x + 8, y + 6); ctx.stroke(); ctx.fillStyle = '#f2c14e'; ctx.fillRect(x + 36, y + 24, 5, 5);
+      ctx.fillStyle = '#111'; ctx.fillRect(x + 36, y + 3, 3, 3);
+    } else if (scene === 2) {                                       // volcano: kabuto helmet with horns, flame tail
+      ctx.fillStyle = '#f2c14e'; ctx.beginPath(); ctx.moveTo(x + 33, y - 3); ctx.lineTo(x + 28, y - 19); ctx.lineTo(x + 40, y - 3); ctx.moveTo(x + 46, y - 3); ctx.lineTo(x + 56, y - 19); ctx.lineTo(x + 56, y - 3); ctx.fill();
+      ctx.fillStyle = '#7a1a1a'; ctx.fillRect(x + 30, y - 3, 26, 8); ctx.fillStyle = '#f2c14e'; ctx.fillRect(x + 30, y + 3, 26, 2);
+      ctx.fillStyle = '#2a1010'; ctx.fillRect(x + 14, y + 27, 32, 9); ctx.fillStyle = '#ff8a1a'; ctx.fillRect(x + 14, y + 31, 32, 2);
+      for (let i = 0; i < 3; i++) { const fl = Math.sin(T * 18 + i * 2) * 4; ctx.fillStyle = i % 2 ? '#ffd166' : '#ff6a1a';
+        ctx.beginPath(); ctx.moveTo(x + 2, y + 16 + i * 5); ctx.lineTo(x - 14 + fl, y + 14 + i * 5); ctx.lineTo(x + 2, y + 22 + i * 5); ctx.fill(); }
+      ctx.fillStyle = '#ffe066'; ctx.fillRect(x + 36, y + 5, 3, 3);
+    } else if (scene === 3) {                                       // neon: cyber visor, headband, neon blade
+      ctx.shadowColor = ac; ctx.shadowBlur = 12; ctx.fillStyle = ac; ctx.fillRect(x + 33, y + 2, 22, 5);
+      ctx.strokeStyle = ac; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(x + 38, y + 26); ctx.lineTo(x + 6, y + 4); ctx.stroke();
+      ctx.fillStyle = '#ff2f9a'; ctx.shadowColor = '#ff2f9a'; ctx.fillRect(x + 30, y + 8, 25, 3); for (let i = 0; i < 3; i++) ctx.fillRect(x + 26 - i * 6, y + 9 + Math.sin(ph + i) * 3, 6, 3);
+      ctx.fillRect(x + 16, y + 27, 28, 3); ctx.fillStyle = ac; ctx.shadowColor = ac; ctx.fillRect(x + 16, y + 33, 28, 2); ctx.shadowBlur = 0;
+    } else if (scene === 4) {                                       // winter: frosty kasa, blue scarf, ice blade
+      ctx.fillStyle = '#6d8fb3'; ctx.beginPath(); ctx.moveTo(x + 24, y + 2); ctx.lineTo(x + 42, y - 16); ctx.lineTo(x + 62, y + 2); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(x + 34, y - 7); ctx.lineTo(x + 42, y - 16); ctx.lineTo(x + 50, y - 7); ctx.fill();
+      ctx.fillStyle = '#35506b'; ctx.fillRect(x + 24, y + 1, 38, 2.5);
+      ctx.fillStyle = '#fff'; ctx.fillRect(x + 26, y + 13, 22, 5); ctx.fillStyle = '#6fb3e0'; ctx.fillRect(x + 27, y + 17, 20, 4); for (let i = 0; i < 4; i++) ctx.fillRect(x + 21 - i * 6, y + 17 + Math.sin(ph + i) * 3, 6, 4);
+      ctx.fillStyle = '#2f6a9c'; ctx.fillRect(x + 14, y + 27, 32, 9); ctx.fillStyle = '#e8f6ff'; ctx.fillRect(x + 14, y + 31, 32, 1.5);
+      ctx.strokeStyle = '#bfe9ff'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(x + 38, y + 26); ctx.lineTo(x + 8, y + 6); ctx.stroke(); ctx.fillStyle = '#35506b'; ctx.fillRect(x + 36, y + 24, 5, 5);
+      ctx.fillStyle = '#16324a'; ctx.fillRect(x + 36, y + 3, 3, 3);
+    } else if (scene === 5) {                                       // ninja: hood, glowing eyes, headband, blade
+      ctx.fillStyle = '#0c1426'; ctx.fillRect(x + 30, y - 2, 26, 11); ctx.fillRect(x + 36, y + 9, 20, 6);
+      ctx.shadowColor = ac; ctx.shadowBlur = 10; ctx.fillStyle = ac; ctx.fillRect(x + 37, y + 3, 14, 3); ctx.shadowBlur = 0;
+      ctx.fillStyle = '#e0303d'; ctx.fillRect(x + 30, y - 2, 26, 3); for (let i = 0; i < 3; i++) ctx.fillRect(x + 27 - i * 6, y - 1 + Math.sin(ph + i) * 3, 6, 3);
+      ctx.fillStyle = ac; ctx.fillRect(x + 14, y + 29, 32, 3);
+      ctx.strokeStyle = ac; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x + 40, y + 24); ctx.lineTo(x + 8, y + 5); ctx.stroke();
+    } else if (scene === 6) {                                       // great wave: hachimaki, happi coat with waves
+      ctx.fillStyle = '#fff'; ctx.fillRect(x + 30, y + 1, 26, 4); ctx.fillStyle = '#d62839'; ctx.fillRect(x + 40, y + 1, 5, 4);
+      ctx.fillStyle = '#fff'; for (let i = 0; i < 3; i++) ctx.fillRect(x + 27 - i * 6, y + 3 + Math.sin(ph + i) * 3, 6, 3);
+      ctx.fillStyle = '#1d4f91'; ctx.fillRect(x + 14, y + 25, 32, 13); ctx.fillStyle = '#fff'; ctx.fillRect(x + 14, y + 25, 32, 2);
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.beginPath(); for (let k = 0; k < 3; k++) { ctx.moveTo(x + 17 + k * 10, y + 36); ctx.arc(x + 22 + k * 10, y + 36, 5, Math.PI, 0); } ctx.stroke();
+      ctx.strokeStyle = '#dfe9f2'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(x + 38, y + 26); ctx.lineTo(x + 8, y + 6); ctx.stroke(); ctx.fillStyle = '#d62839'; ctx.fillRect(x + 36, y + 24, 5, 5);
+      ctx.fillStyle = '#111'; ctx.fillRect(x + 36, y + 3, 3, 3);
+    }
+  }
+  function drawDino() {
+    const x = DX(), y = GY - dino.y - DH + 2, duck = dino.duck && dino.y === 0 && state === 'run';
+    const fr = state === 'run' && dino.y === 0 ? (runTime * 10 | 0) % 2 : 0;
+    if (inv > 0 && (inv * 12 | 0) % 2) ctx.globalAlpha = .4;
+    ctx.save();
+    if (duck) { ctx.translate(x, GY + 2); ctx.scale(1.3, .6); ctx.translate(-x, -(GY + 2)); }
+    const gc = fever > 0 ? `hsl(${T * 500 % 360},100%,60%)` : scene === 3 ? '#35f0ff' : scene === 2 ? '#ff8a1a' : scene === 5 ? '#9fe6c0' : null;
+    if (gc) { ctx.shadowColor = gc; ctx.shadowBlur = fever > 0 ? 24 : 12; }
+    ctx.fillStyle = SCENES[scene].body; rows(BODY, x, y); rows(LEGS[fr], x, y + 42); ctx.shadowBlur = 0;
+    if (scene > 0) { ctx.fillStyle = scene === 3 ? '#0b0220' : '#fff'; if (scene === 1) ctx.fillStyle = '#fff'; ctx.fillRect(x + 36, y + 3, 3, 3); }
+    costume(x, y);
+    ctx.restore(); ctx.globalAlpha = 1;
+    if (fever > 0) { ctx.strokeStyle = 'rgba(255,255,255,.9)'; ctx.lineWidth = 5; ctx.beginPath(); ctx.arc(x + 44, GY - dino.y - 26, 46, -1.1 + Math.sin(T * 20) * .25, 1.1); ctx.stroke(); }
+    if (shield) { ctx.fillStyle = 'rgba(120,220,255,.18)'; ctx.strokeStyle = 'rgba(120,220,255,.9)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x + DW / 2, GY - dino.y - DH / 2, 42, 0, 6.28); ctx.fill(); ctx.stroke(); }
+  }
+
+  // ---------- Main draw ----------
+  function draw() {
+    TXD = lum(0) > 140; TGD = lum(4) > 140;
+    ctx.save();
+    if (shake > 0) ctx.translate(rnd(-1, 1) * shake * 14, rnd(-1, 1) * shake * 14);
+    const g = ctx.createLinearGradient(0, 0, 0, GY); g.addColorStop(0, C(0)); g.addColorStop(1, C(1));
+    ctx.fillStyle = g; ctx.fillRect(-20, -20, W + 40, H + 40);
+
+    if (blendT < 1) bgScene(from, 1); bgScene(scene, blendT);
+
+    ctx.fillStyle = C(4); ctx.fillRect(-20, GY + 2, W + 40, H);
+    ctx.save(); if (scene > 1) { ctx.shadowColor = C(6); ctx.shadowBlur = 10; }
+    ctx.fillStyle = C(scene === 0 ? 5 : 6); ctx.fillRect(-20, GY + 2, W + 40, scene === 0 ? 1.5 : 3); ctx.restore();
+    ctx.fillStyle = scene === 0 ? C(5) : 'rgba(255,255,255,.15)'; bumps.forEach(q => ctx.fillRect(q.x, GY + 2 + q.dy, q.w, 1.5));
+    if (scene === 3) { ctx.fillStyle = C(6, .22); for (let x = -((dist * .6) % 40); x < W; x += 40) ctx.fillRect(x, GY + 5, 1, H); ctx.fillRect(0, GY + 14, W, 1); ctx.fillRect(0, GY + 32, W, 1); }
+
+    syncY();
+    obstacles.forEach(o => { ctx.save(); if (o.s > 1) { ctx.shadowColor = C(6); ctx.shadowBlur = 10; }
+      o.type === 'ground' ? groundObs(o) : o.type === 'bird' ? flyer(o) : shuriken(o); ctx.restore(); });
+
+    coins.forEach(c => { const w = Math.abs(Math.cos(T * 5 + c.ph)) * 9 + 1, y = GY - c.lift - 10, gold = scene > 0;
+      ctx.fillStyle = gold ? '#ffcf3a' : C(5); ctx.strokeStyle = gold ? '#a06a00' : C(5); ctx.lineWidth = 2; ctx.beginPath(); ctx.ellipse(c.x, y, w, 9, 0, 0, 6.28); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = gold ? '#a06a00' : C(0); ctx.fillRect(c.x - w * .22, y - 3, w * .44, 6); });
+    pows.forEach(p => { const y = GY - p.lift - 12 + Math.sin(T * 4) * 3;
+      ctx.fillStyle = '#fff6e0'; ctx.strokeStyle = '#d62839'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(p.x, y, 15, 0, 6.28); ctx.fill(); ctx.stroke();
+      ctx.strokeStyle = '#2b1b1f'; ctx.lineWidth = 2.5; ctx.beginPath();
+      if (p.type === 'shield') { ctx.moveTo(p.x - 7, y - 7); ctx.lineTo(p.x + 7, y - 7); ctx.lineTo(p.x + 5, y + 4); ctx.lineTo(p.x, y + 9); ctx.lineTo(p.x - 5, y + 4); ctx.closePath(); }
+      else { ctx.moveTo(p.x, y - 8); ctx.lineTo(p.x, y); ctx.lineTo(p.x + 6, y + 3); } ctx.stroke(); });
+
+    if (meteor) {
+      const ice = scene === 4 || scene === 6, m0 = scene === 3 ? '255,47,154' : ice ? '111,179,224' : '255,140,0', m1 = scene === 3 ? '#35f0ff' : ice ? '#bfe9ff' : '#ff7a1a';
+      if (meteor.warn > 0) {
+        ctx.setLineDash([4, 8]); ctx.strokeStyle = 'rgba(255,60,60,.55)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(meteor.x, 40); ctx.lineTo(meteor.x, GY); ctx.stroke(); ctx.setLineDash([]);
+        if ((meteor.warn * 8 | 0) % 2) { ctx.fillStyle = '#ff3b3b'; ctx.beginPath(); ctx.moveTo(meteor.x, 14); ctx.lineTo(meteor.x + 14, 40); ctx.lineTo(meteor.x - 14, 40); ctx.fill(); text('!', meteor.x, 38, 18, '#fff'); }
+      } else {
+        const tr = ctx.createLinearGradient(0, meteor.y - 80, 0, meteor.y); tr.addColorStop(0, `rgba(${m0},0)`); tr.addColorStop(1, `rgba(${m0},.9)`);
+        ctx.strokeStyle = tr; ctx.lineWidth = 14; ctx.beginPath(); ctx.moveTo(meteor.x, meteor.y - 80); ctx.lineTo(meteor.x, meteor.y); ctx.stroke();
+        ctx.fillStyle = m1; ctx.beginPath(); ctx.arc(meteor.x, meteor.y, 12, 0, 6.28); ctx.fill();
+        ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(meteor.x, meteor.y, 5, 0, 6.28); ctx.fill();
+      }
+    }
+
+    ctx.fillStyle = 'rgba(0,0,0,.2)'; ctx.beginPath(); ctx.ellipse(DX() + DW / 2, GY + 5, 26 - dino.y * .12, 4, 0, 0, 6.28); ctx.fill();
+    drawDino();
+    if (ring >= 0) { ctx.globalAlpha = 1 - ring / .6; ctx.strokeStyle = SCENES[scene].acc; ctx.lineWidth = 6; ctx.beginPath(); ctx.arc(DX() + DW / 2, GY - dino.y - 25, 20 + ring * 520, 0, 6.28); ctx.stroke(); ctx.globalAlpha = 1; }
+    parts.forEach(p => { ctx.globalAlpha = Math.max(0, p.life / p.max); ctx.fillStyle = p.c || tc(); ctx.fillRect(p.x, p.y, p.s, p.s); }); ctx.globalAlpha = 1;
+
+    if (scene === 1) { ctx.fillStyle = 'rgba(255,183,208,.9)'; weather.forEach(p => { ctx.beginPath(); ctx.ellipse(p.x, p.y, p.r, p.r * .55, p.ph + T, 0, 6.28); ctx.fill(); }); }
+    else if (scene === 2) weather.forEach(p => { ctx.fillStyle = `rgba(255,${140 + p.v * 100 | 0},40,${.5 + .4 * Math.sin(T * 6 + p.ph)})`; ctx.fillRect(p.x, p.y, 2.5, 2.5); });
+    else if (scene === 3) { ctx.strokeStyle = 'rgba(53,240,255,.35)'; ctx.lineWidth = 1.2; ctx.beginPath(); weather.forEach(p => { ctx.moveTo(p.x, p.y); ctx.lineTo(p.x + 4, p.y - 14); }); ctx.stroke(); }
+    else if (scene === 4) { ctx.fillStyle = 'rgba(255,255,255,.95)'; ctx.strokeStyle = 'rgba(47,75,102,.25)'; ctx.lineWidth = 1; weather.forEach(p => { ctx.beginPath(); ctx.arc(p.x, p.y, p.r * .6, 0, 6.28); ctx.fill(); ctx.stroke(); }); }
+    else if (scene === 5) weather.forEach(p => { ctx.fillStyle = `rgba(200,255,120,${.35 + .6 * Math.max(0, Math.sin(T * 3 + p.ph))})`; ctx.shadowColor = '#d8ff80'; ctx.shadowBlur = 8; ctx.fillRect(p.x, p.y, 3, 3); ctx.shadowBlur = 0; });
+    else if (scene === 6) { ctx.fillStyle = 'rgba(255,255,255,.65)'; weather.forEach(p => ctx.fillRect(p.x, p.y, p.r * .6, p.r * .6)); }
+    floaters.forEach(f => { ctx.globalAlpha = Math.min(1, f.t * 2); text(f.text, f.x, f.y, 16, f.c || tc()); }); ctx.globalAlpha = 1;
+    ctx.restore();
+
+    if (state === 'run' && speed > 520) { ctx.strokeStyle = `rgba(255,255,255,${Math.min(.22, (speed - 520) / 1800)})`; ctx.lineWidth = 1.5; ctx.beginPath();
+      for (let i = 0; i < 14; i++) { const ly = (i * 67) % GY, lx = W + 100 - ((dist * 1.6 + i * 211) % (W + 200)); ctx.moveTo(lx, ly); ctx.lineTo(lx + 90, ly); } ctx.stroke(); }
+    if (fever > 0) { ctx.fillStyle = 'rgba(214,40,57,.12)'; ctx.fillRect(0, 0, W, H); }
+    if (scene > 0) { const vg = ctx.createRadialGradient(W / 2, H / 2, H * .5, W / 2, H / 2, Math.max(W, H) * .75); vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,.3)'); ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H); }
+    if (wflash > 0) { ctx.fillStyle = `rgba(255,255,255,${Math.min(1, wflash)})`; ctx.fillRect(0, 0, W, H); }
+
+    // HUD
+    const mono = '"Courier New", monospace';
+    text(`HI ${pad(hi)}  ${flash <= 0 || (flash * 10 | 0) % 2 === 0 ? pad(score) : '     '}`, W - 24, 32, 18, tc(), 'right', 'bold', mono);
+    if (has('coins')) { ctx.fillStyle = scene > 0 ? '#ffcf3a' : C(5); ctx.beginPath(); ctx.arc(W - 128, 52, 7, 0, 6.28); ctx.fill(); text('x ' + coinCount, W - 112, 58, 16, tc(), 'left', 'bold', mono); }
+    if (combo > 1) text('COMBO x' + combo, W - 24, 84, 16, scene ? '#ffb703' : tc(), 'right');
+    if (has('fever')) { const bw = 140, bx = W - 24 - bw;
+      ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(bx, 96, bw, 8); ctx.fillStyle = fever > 0 ? `hsl(${T * 500 % 360},100%,60%)` : '#d62839'; ctx.fillRect(bx, 96, bw * (fever > 0 ? fever / 6 : charge / FEVER_AT), 8);
+      text(fever > 0 ? 'RAGE!' : 'Rage', bx - 8, 105, 12, tc(), 'right'); }
+    
+    if (state === 'run') {
+      { const st = [shield ? 'Shield on' : '', slow > 0 ? 'Slow-mo ' + slow.toFixed(1) + 's' : '', (nextU < UNLOCKS.length ? 'Next unlock: ' + UNLOCKS[nextU].title + ' at ' + UNLOCKS[nextU].at : 'Everything unlocked!') + '  ·  Next scene at ' + (Math.floor(score / 300) + 1) * 300].filter(Boolean).join('   ·   ');
+        text(st, W / 2, H - 10, 12, tg(.7), 'center', 'normal'); }          // bottom strip, on the ground
+      
+    }
+
+    if (banner.t > 0 && banner.title !== undefined) {              // small see-through toast in the top strip (clear of the play area)
+      const acc = banner.scene ? SCENES[scene].acc : '#ffcf3a', x0 = Math.max(170, DX() + 110), maxW = Math.max(150, W - x0 - 210);
+      const l1 = banner.scene ? 'NEW SCENE: ' + banner.scene : 'NEW  ' + banner.title;
+      const l2 = (banner.scene && banner.title ? 'NEW  ' + banner.title + '  ·  ' : '') + banner.tip;
+      ctx.font = 'bold 15px ' + FONT; const w1 = ctx.measureText(l1).width; ctx.font = '12px ' + FONT; const w2 = ctx.measureText(l2).width;
+      const k = Math.min(1, (maxW - 24) / Math.max(w1, w2, 1)), bw = Math.max(w1, w2) * k + 24;
+      ctx.globalAlpha = Math.min(.8, banner.t * 1.5); ctx.fillStyle = 'rgba(15,6,12,.75)'; ctx.fillRect(x0, 8, bw, 46); ctx.fillStyle = acc; ctx.fillRect(x0, 8, 3, 46);
+      text(l1, x0 + 12, 27, 15 * k, acc, 'left'); text(l2, x0 + 12, 45, 12 * k, '#fff', 'left', 'normal');
+      ctx.globalAlpha = 1;
+    }
+
+    const cx = W / 2, by = GY + Math.min(62, (H - GY) * .5);
+    if (state === 'over') {
+      const oy = Math.max(70, GY * .38);
+      if ('letterSpacing' in ctx) ctx.letterSpacing = '6px';
+      text('GAME OVER', cx + 3, oy, 30, tc()); if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+      text(`Score ${Math.floor(score)}` + (coinCount ? `   ·   Coins ${coinCount}` : '') + (newBest ? '   ·   New best!' : ''), cx, oy + 32, 18, tc());
+      text(`Scene: ${SCENES[scene].n}   ·   Features unlocked: ${nextU} of ${UNLOCKS.length}`, cx, oy + 56, 14, tc(.8), 'center', 'normal');
+    }
+    if (state !== 'run') {
+      text(state === 'idle' ? 'Press space to play' : 'Press space to play again', cx, by, 22, tg(.9));
+      text('Space / ↑ jump  ·  ↓ duck  ·  F fullscreen  ·  tap to jump', cx, by + 26, 13, tg(.65), 'center', 'normal');
+      text('A new feature every 100 points. At 300 the world changes.', cx, by + 46, 13, tg(.65), 'center', 'normal');
+    }
+  }
+
+  let lastT = performance.now();
+  (function frame(t) { const dt = Math.min((t - lastT) / 1000, .05); lastT = t; update(dt); draw(); requestAnimationFrame(frame); })(lastT);
+})();
+</script>
+</body>
+</html>
